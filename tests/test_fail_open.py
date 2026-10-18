@@ -6,8 +6,8 @@ failure is logged. A context tool must never be the reason an agent
 run dies. All traffic here goes to a fake upstream on 127.0.0.1.
 """
 
-import json
 import http.client
+import json
 import time
 import urllib.error
 
@@ -111,12 +111,13 @@ def test_upstream_500_passes_through_and_proxy_survives(fake_upstream, tmp_path)
 
 
 @requires_core
-def test_mid_stream_drop_does_not_wedge_proxy(fake_upstream, tmp_path):
+@pytest.mark.parametrize("stream_mode", ["stream", "stream_length"])
+def test_mid_stream_drop_does_not_wedge_proxy(fake_upstream, tmp_path, stream_mode):
     project = make_project(tmp_path)
     request = messages_request([], extra={"stream": True})
     raw = json.dumps(request).encode()
     with ProxyProcess(project, fake_upstream.url, tmp_path / "work") as proxy:
-        fake_upstream.mode = "stream"
+        fake_upstream.mode = stream_mode
         fake_upstream.server.drop_after = 1  # upstream dies mid-stream
         started = time.monotonic()
         try:
