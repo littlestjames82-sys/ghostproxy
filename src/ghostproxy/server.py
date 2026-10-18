@@ -205,10 +205,12 @@ def make_handler(state: ProxyState):
                         chunk = exc.partial or b""
                         if chunk:
                             self._write_chunk(chunk, chunked)
-                        break  # upstream dropped mid-stream: end cleanly
+                        self.close_connection = True
+                        return resp.status
                     except (ConnectionError, OSError,
                             http.client.HTTPException):
-                        break  # dropped stream must not wedge the proxy
+                        self.close_connection = True
+                        return resp.status
                     if not chunk:
                         break
                     self._write_chunk(chunk, chunked)
@@ -221,13 +223,8 @@ def make_handler(state: ProxyState):
                 return resp.status
             except Exception:
                 if headers_sent:
-                    # Too late for a 502; close out the stream gracefully.
-                    if chunked:
-                        try:
-                            self.wfile.write(b"0\r\n\r\n")
-                            self.wfile.flush()
-                        except Exception:
-                            pass
+                    # Do not mark a truncated response as complete.
+                    self.close_connection = True
                     return None
                 try:
                     msg = b'{"error":"ghostproxy: upstream unreachable"}'
