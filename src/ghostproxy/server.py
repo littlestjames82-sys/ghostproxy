@@ -22,8 +22,7 @@ from .ledger import Ledger, make_entry
 from .transform import TransformResult, transform_request
 
 HOP_BY_HOP = {"host", "connection", "keep-alive", "proxy-connection",
-              "transfer-encoding", "te", "trailer", "upgrade",
-              "content-length"}
+              "transfer-encoding", "te", "trailer", "upgrade"}
 MESSAGES_PATHS = ("/v1/messages", "/v1/messages/")
 
 
@@ -167,12 +166,11 @@ def make_handler(state: ProxyState):
             target = state.upstream_base + self.path
             headers = {}
             for key, value in self.headers.items():
-                if key.lower() in HOP_BY_HOP:
+                if key.lower() in HOP_BY_HOP or key.lower() == "content-length":
                     continue
                 # Auth and every other end-to-end header forward as-is.
                 headers[key] = value
-            if body:
-                headers["Content-Length"] = str(len(body))
+            headers["Content-Length"] = str(len(body))
             conn_cls = (http.client.HTTPSConnection
                         if state.upstream_scheme == "https"
                         else http.client.HTTPConnection)
@@ -198,19 +196,26 @@ def make_handler(state: ProxyState):
                     chunked = True
                 self.end_headers()
                 headers_sent = True
+                response_bytes = 0
                 while True:
                     try:
-                        chunk = resp.read(8192)
+                        chunk = resp.read1(8192)
                     except http.client.IncompleteRead as exc:
                         chunk = exc.partial or b""
                         if chunk:
                             self._write_chunk(chunk, chunked)
-                        break  # upstream dropped mid-stream: end cleanly
+                        self.close_connection = True
+                        return resp.status
                     except (ConnectionError, OSError,
                             http.client.HTTPException):
-                        break  # dropped stream must not wedge the proxy
+                        self.close_connection = True
+                        return resp.status
                     if not chunk:
+                        if resp_len is not None and response_bytes < resp_len:
+                            self.close_connection = True
+                            return resp.status
                         break
+                    response_bytes += len(chunk)
                     self._write_chunk(chunk, chunked)
                 if chunked:
                     try:
@@ -221,13 +226,8 @@ def make_handler(state: ProxyState):
                 return resp.status
             except Exception:
                 if headers_sent:
-                    # Too late for a 502; close out the stream gracefully.
-                    if chunked:
-                        try:
-                            self.wfile.write(b"0\r\n\r\n")
-                            self.wfile.flush()
-                        except Exception:
-                            pass
+                    # Do not mark a truncated response as complete.
+                    self.close_connection = True
                     return None
                 try:
                     msg = b'{"error":"ghostproxy: upstream unreachable"}'

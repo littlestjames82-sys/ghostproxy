@@ -130,20 +130,31 @@ class _UpstreamHandler(BaseHTTPRequestHandler):
             self._send(500, b'{"type":"error","error":{"type":"api_error",'
                             b'"message":"fake upstream failure"}}')
             return
-        if mode == "stream":
+        if mode in ("stream", "stream_length"):
+            payloads = [
+                f'data: {{"type":"content_block_delta","index":0,"delta":{{"text":"chunk-{i}"}}}}\n\n'.encode()
+                for i in range(3)
+            ]
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
-            self.send_header("Transfer-Encoding", "chunked")
+            if mode == "stream":
+                self.send_header("Transfer-Encoding", "chunked")
+            else:
+                self.send_header("Content-Length", str(sum(map(len, payloads))))
             self.end_headers()
-            for i in range(3):
-                payload = f'data: {{"type":"content_block_delta","index":0,"delta":{{"text":"chunk-{i}"}}}}\n\n'.encode()
+            for i, payload in enumerate(payloads):
                 if self.server.drop_after is not None and i >= self.server.drop_after:
+                    self.close_connection = True
                     self.connection.close()
                     return
-                self.wfile.write(b"%x\r\n%s\r\n" % (len(payload), payload))
+                if mode == "stream":
+                    self.wfile.write(b"%x\r\n%s\r\n" % (len(payload), payload))
+                else:
+                    self.wfile.write(payload)
                 self.wfile.flush()
                 time.sleep(0.02)
-            self.wfile.write(b"0\r\n\r\n")
+            if mode == "stream":
+                self.wfile.write(b"0\r\n\r\n")
             return
         if mode == "mirror":
             self._send(200, body, self.headers.get("Content-Type", "application/json"))
