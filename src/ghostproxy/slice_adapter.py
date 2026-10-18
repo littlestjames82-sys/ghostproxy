@@ -110,6 +110,117 @@ def _looks_placeholder(value: str) -> bool:
     return False
 
 
+# ---------------------------------------------------------------------------
+# Duplicate detection (exact-normalized + near), delegated to GhostSlice.
+#
+# GhostSlice's canonical detector (ghostslice/duplicates.py) defines:
+# exact = sha256 of normalized content (per-line trailing whitespace
+# stripped, trailing blank lines dropped), ignoring content shorter
+# than 20 normalized characters; near = Jaccard similarity over the
+# set of distinct non-empty stripped lines ("line shingles"), only for
+# texts with at least 200 normalized characters and at least 8
+# distinct lines, at similarity >= 0.85. The helpers below use those
+# very functions when GhostSlice is importable; the local definitions
+# are a line-for-line copy of the same algorithm (constants included)
+# so the Slice-absent path -- where duplicate dropping still runs,
+# unlike slicing itself -- detects exactly the same duplicates.
+# Only digests, line sets, and a similarity score ever leave this
+# module: never file content.
+
+NEAR_THRESHOLD = 0.85
+NEAR_MIN_LINES = 8
+NEAR_MIN_CHARS = 200
+EXACT_MIN_CHARS = 20
+
+
+def _local_normalize(text: str) -> str:
+    lines = [ln.rstrip() for ln in text.splitlines()]
+    while lines and not lines[-1]:
+        lines.pop()
+    return "\n".join(lines)
+
+
+def _local_line_shingles(text: str) -> set:
+    return {ln.strip() for ln in _local_normalize(text).splitlines()
+            if ln.strip()}
+
+
+def _gs_duplicates():
+    """The ghostslice.duplicates module, or None when unavailable."""
+    if not available():
+        return None
+    try:
+        from ghostslice import duplicates
+        return duplicates
+    except Exception:
+        return None
+
+
+def normalize_content(text: str) -> str:
+    """GhostSlice's normalization for duplicate comparison."""
+    mod = _gs_duplicates()
+    if mod is not None:
+        try:
+            return mod.normalize(text)
+        except Exception:
+            pass
+    return _local_normalize(text)
+
+
+def line_shingles(text: str) -> set:
+    """The distinct non-empty stripped lines of *text* (near shingles)."""
+    mod = _gs_duplicates()
+    if mod is not None:
+        try:
+            return set(mod.line_shingles(text))
+        except Exception:
+            pass
+    return _local_line_shingles(text)
+
+
+def duplicate_fingerprint(text: str) -> dict:
+    """Everything duplicate comparison needs for one text, content-free
+    beyond the in-memory line set: the normalized text's digest (None
+    below GhostSlice's exact noise floor), its line shingles, and
+    whether it clears the near-duplicate size floors."""
+    mod = _gs_duplicates()
+    threshold_chars = NEAR_MIN_CHARS
+    min_lines = NEAR_MIN_LINES
+    exact_min = EXACT_MIN_CHARS
+    if mod is not None:
+        threshold_chars = getattr(mod, "NEAR_MIN_CHARS", threshold_chars)
+        min_lines = getattr(mod, "NEAR_MIN_LINES", min_lines)
+        exact_min = getattr(mod, "EXACT_MIN_CHARS", exact_min)
+    normalized = normalize_content(text)
+    shingles = line_shingles(text)
+    digest = None
+    if len(normalized) >= exact_min:
+        import hashlib
+        digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+    return {
+        "normalized_digest": digest,
+        "shingles": shingles,
+        "near_eligible": len(normalized) >= threshold_chars
+                         and len(shingles) >= min_lines,
+    }
+
+
+def near_similarity(fp_a: dict, fp_b: dict) -> float:
+    """Jaccard similarity of two fingerprints' line shingles (0.0-1.0)."""
+    sa, sb = fp_a.get("shingles") or set(), fp_b.get("shingles") or set()
+    union = sa | sb
+    if not union:
+        return 0.0
+    return len(sa & sb) / len(union)
+
+
+def near_threshold() -> float:
+    mod = _gs_duplicates()
+    if mod is not None:
+        return float(getattr(mod, "NEAR_THRESHOLD", NEAR_THRESHOLD))
+    return NEAR_THRESHOLD
+
+
 def scan_secrets(path: str, text: str) -> list[dict]:
     """Secret findings for one text: [{path, line, type}] and nothing else.
 

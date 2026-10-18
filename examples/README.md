@@ -15,12 +15,19 @@ no network calls beyond 127.0.0.1, no spend.
 
 ## Five-minute demo (fake upstream, no key)
 
+Run these from the GhostProxy repo root, with a GhostSlice checkout
+next to it (`../ghostslice`), as in the main README. GhostSlice's
+`src` is on the PYTHONPATH in the proxy and report commands: without
+it the proxy still runs, but fail-open, passing everything through
+unsliced, and the transform map described below will not appear.
+
 ```bash
 # terminal 1: fake upstream
 python3 examples/fake_upstream.py 9999
 
 # terminal 2: the proxy, watching the sample project
-PYTHONPATH=src python3 -m ghostproxy serve --host 127.0.0.1 --port 8765 \
+PYTHONPATH=src:../ghostslice/src python3 -m ghostproxy serve \
+  --host 127.0.0.1 --port 8765 \
   --upstream http://127.0.0.1:9999 --project examples/sample-project
 
 # terminal 3: send the example request through the proxy
@@ -31,7 +38,8 @@ curl -s http://127.0.0.1:8765/v1/messages \
   --data @examples/request.example.json
 
 # then look at what the proxy recorded
-PYTHONPATH=src python3 -m ghostproxy report --project examples/sample-project
+PYTHONPATH=src:../ghostslice/src python3 -m ghostproxy report \
+  --project examples/sample-project
 ```
 
 In the transform map for that request you should see

@@ -17,13 +17,16 @@ from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
-from .config import ProxyConfig
+from .config import ConfigError, ProxyConfig
 from .ledger import Ledger, make_entry
 from .transform import TransformResult, transform_request
 
 HOP_BY_HOP = {"host", "connection", "keep-alive", "proxy-connection",
-              "transfer-encoding", "te", "trailer", "upgrade"}
+              "transfer-encoding", "te", "trailer", "upgrade",
+              "content-length"}
 MESSAGES_PATHS = ("/v1/messages", "/v1/messages/")
+_MESSAGES_SET = {p.rstrip("/") for p in MESSAGES_PATHS}
+_LOCAL_PATHS = ("/", "/health", "/api/recent")
 
 
 class ProxyState:
@@ -59,7 +62,7 @@ def make_handler(state: ProxyState):
 
         # ---------------- local pages ----------------
         def do_GET(self):
-            if self.path in ("/", "/health", "/api/recent"):
+            if self.path.split("?", 1)[0] in _LOCAL_PATHS:
                 return self._local_page()
             return self._proxy()
 
@@ -76,10 +79,11 @@ def make_handler(state: ProxyState):
             return self._proxy()
 
         def _local_page(self):
-            if self.path == "/health":
+            path_only = self.path.split("?", 1)[0]
+            if path_only == "/health":
                 body = b'{"status":"ok","tool":"ghostproxy","version":"0.1.0"}'
                 return self._send_local(200, body, "application/json")
-            if self.path == "/api/recent":
+            if path_only == "/api/recent":
                 with state.lock:
                     items = list(state.recent)
                 body = json.dumps({"recent": items}).encode()
@@ -117,21 +121,77 @@ def make_handler(state: ProxyState):
             self.end_headers()
             self.wfile.write(body)
 
+        # ---------------- request body reading ----------------
+        def _read_body(self) -> bytes:
+            """Read the request body without ever raising on a malformed
+            framing header. The old code did ``int(Content-Length)``
+            directly: a non-numeric value crashed the handler (dropping
+            the connection, fail-open violated) and a negative value
+            made ``rfile.read(-n)`` block until EOF. Chunked bodies
+            were silently read as empty and forwarded as empty. All
+            three now degrade to a well-defined body instead."""
+            transfer_encoding = (self.headers.get("Transfer-Encoding")
+                                 or "").lower()
+            if "chunked" in transfer_encoding:
+                return self._read_chunked()
+            raw_length = self.headers.get("Content-Length")
+            if raw_length is None:
+                return b""
+            try:
+                length = int(raw_length.strip())
+            except (TypeError, ValueError, AttributeError):
+                # Unframable: treat as no body and do not let the
+                # leftover bytes poison the next keep-alive request.
+                self.close_connection = True
+                return b""
+            if length < 0:
+                self.close_connection = True
+                return b""
+            return self.rfile.read(length) if length else b""
+
+        def _read_chunked(self) -> bytes:
+            chunks = []
+            while True:
+                size_line = self.rfile.readline(65536)
+                if not size_line:
+                    break
+                try:
+                    size = int(size_line.split(b";", 1)[0].strip(), 16)
+                except ValueError:
+                    self.close_connection = True
+                    break
+                if size == 0:
+                    # Consume any trailers up to the blank line.
+                    while True:
+                        line = self.rfile.readline(65536)
+                        if line in (b"\r\n", b"\n", b""):
+                            break
+                    break
+                data = self.rfile.read(size)
+                chunks.append(data)
+                self.rfile.read(2)  # trailing CRLF after each chunk
+                if len(data) < size:
+                    break  # peer went away mid-chunk; forward what we have
+            return b"".join(chunks)
+
         # ---------------- proxy core ----------------
         def _proxy(self):
             start = time.monotonic()
-            length = int(self.headers.get("Content-Length") or 0)
-            raw = self.rfile.read(length) if length else b""
+            raw = self._read_body()
             cfg = state.config
 
             body = raw
             transform_dict = None
             fallback = False
             fallback_reason = ""
-            if length > cfg.max_body_bytes:
+            # Route on the path only: a query string ("?beta=true" and
+            # similar) must not silently disable transformation -- an
+            # untransformed request would forward secret-flagged files
+            # the guard was supposed to exclude.
+            path_only = self.path.split("?", 1)[0]
+            if len(raw) > cfg.max_body_bytes:
                 fallback, fallback_reason = True, "oversize-body-pass-through"
-            elif self.path.rstrip("/") in (p.rstrip("/") for p in MESSAGES_PATHS) \
-                    and cfg.enabled:
+            elif path_only.rstrip("/") in _MESSAGES_SET and cfg.enabled:
                 body, transform_dict, fallback, fallback_reason = \
                     self._try_transform(raw, cfg)
 
@@ -166,11 +226,12 @@ def make_handler(state: ProxyState):
             target = state.upstream_base + self.path
             headers = {}
             for key, value in self.headers.items():
-                if key.lower() in HOP_BY_HOP or key.lower() == "content-length":
+                if key.lower() in HOP_BY_HOP:
                     continue
                 # Auth and every other end-to-end header forward as-is.
                 headers[key] = value
-            headers["Content-Length"] = str(len(body))
+            if body:
+                headers["Content-Length"] = str(len(body))
             conn_cls = (http.client.HTTPSConnection
                         if state.upstream_scheme == "https"
                         else http.client.HTTPConnection)
@@ -196,26 +257,19 @@ def make_handler(state: ProxyState):
                     chunked = True
                 self.end_headers()
                 headers_sent = True
-                response_bytes = 0
                 while True:
                     try:
-                        chunk = resp.read1(8192)
+                        chunk = resp.read(8192)
                     except http.client.IncompleteRead as exc:
                         chunk = exc.partial or b""
                         if chunk:
                             self._write_chunk(chunk, chunked)
-                        self.close_connection = True
-                        return resp.status
+                        break  # upstream dropped mid-stream: end cleanly
                     except (ConnectionError, OSError,
                             http.client.HTTPException):
-                        self.close_connection = True
-                        return resp.status
+                        break  # dropped stream must not wedge the proxy
                     if not chunk:
-                        if resp_len is not None and response_bytes < resp_len:
-                            self.close_connection = True
-                            return resp.status
                         break
-                    response_bytes += len(chunk)
                     self._write_chunk(chunk, chunked)
                 if chunked:
                     try:
@@ -226,8 +280,13 @@ def make_handler(state: ProxyState):
                 return resp.status
             except Exception:
                 if headers_sent:
-                    # Do not mark a truncated response as complete.
-                    self.close_connection = True
+                    # Too late for a 502; close out the stream gracefully.
+                    if chunked:
+                        try:
+                            self.wfile.write(b"0\r\n\r\n")
+                            self.wfile.flush()
+                        except Exception:
+                            pass
                     return None
                 try:
                     msg = b'{"error":"ghostproxy: upstream unreachable"}'
@@ -269,7 +328,13 @@ BANNER = (
 
 def serve(config: ProxyConfig) -> None:
     if config.host != "127.0.0.1":
-        raise ValueError("GhostProxy v0.1 binds 127.0.0.1 only")
+        # ConfigError (not a bare ValueError) so the CLI reports this
+        # as a clean configuration refusal instead of a traceback.
+        # The config layer accepts "::1" as a loopback literal, but
+        # the v0.1 server binds the IPv4 literal only (README rule).
+        raise ConfigError(
+            "GhostProxy v0.1 binds 127.0.0.1 only "
+            f"(got {config.host!r} after normalisation)")
     state = ProxyState(config)
     httpd = ThreadingHTTPServer((config.host, config.port), make_handler(state))
     print(BANNER)

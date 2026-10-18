@@ -18,17 +18,46 @@ from pathlib import Path
 from .tokens import ESTIMATOR, ESTIMATOR_VERSION
 
 _FORBIDDEN_KEY = re.compile(
-    r"(api[_-]?key|authorization|auth|secret|password|passwd|cookie|"
-    r"bearer|credential|session)", re.IGNORECASE)
+    r"(api[_-]?key|authorization|authentication|oauth|password|passwd|"
+    r"credentials?|bearer|cookies?|secrets?|private[_-]?key)",
+    re.IGNORECASE)
+# "auth" only counts as a whole key token: a bare substring match also
+# dropped innocent keys such as "author" and "authority".
+_FORBIDDEN_AUTH_TOKEN = re.compile(r"(?:^|[_\-\s])auth(?:[_\-\s]|$)",
+                                   re.IGNORECASE)
+# Keys that merely *mention* secrets without holding a value. The
+# transform map's "secret_types" carries finding TYPES only (never a
+# value) and the README promises it in the ledger ("path + finding
+# type only"); the old substring scrub silently deleted it.
+_SCRUB_ALLOWLIST = {"secret_types"}
+
+
+def _is_forbidden_key(key) -> bool:
+    name = str(key)
+    if name.lower() in _SCRUB_ALLOWLIST:
+        return False
+    return bool(_FORBIDDEN_KEY.search(name)
+                or _FORBIDDEN_AUTH_TOKEN.search(name))
 
 
 def _scrub(obj):
     if isinstance(obj, dict):
         return {k: _scrub(v) for k, v in obj.items()
-                if not _FORBIDDEN_KEY.search(str(k))}
+                if not _is_forbidden_key(k)}
     if isinstance(obj, list):
         return [_scrub(v) for v in obj]
     return obj
+
+
+def _as_int(value) -> int:
+    """Ledger fields are ints when we write them, but a hand-edited or
+    older ledger must not crash reporting: unparseable values count 0."""
+    if isinstance(value, bool):
+        return int(value)
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
 
 
 def make_entry(*, project: str, method: str, path: str, status: int,
@@ -100,10 +129,10 @@ class Ledger:
 
 def build_report(entries: list[dict]) -> dict:
     """Aggregate ledger entries into the Bench-consumable report shape."""
-    total_in = sum(int(e.get("tokens_in", 0)) for e in entries)
-    total_out = sum(int(e.get("tokens_out", 0)) for e in entries)
-    ctx_in = sum(int(e.get("context_tokens_in", 0)) for e in entries)
-    ctx_out = sum(int(e.get("context_tokens_out", 0)) for e in entries)
+    total_in = sum(_as_int(e.get("tokens_in", 0)) for e in entries)
+    total_out = sum(_as_int(e.get("tokens_out", 0)) for e in entries)
+    ctx_in = sum(_as_int(e.get("context_tokens_in", 0)) for e in entries)
+    ctx_out = sum(_as_int(e.get("context_tokens_out", 0)) for e in entries)
     fallbacks = sum(1 for e in entries if e.get("fallback"))
     saved = total_in - total_out
     return {

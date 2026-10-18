@@ -90,9 +90,10 @@ def run_doctor(config: ProxyConfig, check_upstream: bool = False) -> list[Check]
                             "pass through (fail-open), budget downgrade off"))
 
     ledger = Ledger(config.ledger_file())
+    writable = ledger.writable()  # one probe; the old code probed twice
     checks.append(Check(
-        "ledger", "ok" if ledger.writable() else "fail",
-        f"ledger writable at {ledger.path}" if ledger.writable()
+        "ledger", "ok" if writable else "fail",
+        f"ledger writable at {ledger.path}" if writable
         else f"ledger NOT writable at {ledger.path}"))
 
     checks.append(Check(

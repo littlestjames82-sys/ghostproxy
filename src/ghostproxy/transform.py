@@ -16,7 +16,11 @@ Per block, in order (plan order):
 1. exclude junk / lockfiles / vendored & generated paths;
 2. exclude blocks whose content trips the secret guard (path+type logged,
    value never recorded);
-3. drop exact duplicates of an earlier kept block;
+3. drop duplicates of an earlier kept block: exact duplicates (raw
+   content, or GhostSlice's normalized content -- trailing whitespace
+   and trailing blank lines ignored) and near duplicates (GhostSlice's
+   line-shingle Jaccard similarity >= 0.85, above its 200-character /
+   8-line size floors; see slice_adapter.duplicate_fingerprint);
 4. if the kept context still exceeds the per-request budget, downgrade
    the largest blocks full -> signatures -> interfaces -> exclude via
    GhostSlice. If GhostSlice is unavailable, no downgrade happens and the
@@ -52,6 +56,11 @@ _HEADER_HASH = re.compile(
     re.IGNORECASE)
 
 _LADDER = ("full", "signatures", "interfaces", "exclude")
+# Every mode a block action can carry: the budget ladder plus
+# GhostSlice's test-stripping default mode. Pass 3 reports mode_after
+# from the action, so an action missing here was misreported as the
+# block's original mode (a stripped test file claimed "full").
+_KNOWN_MODES = frozenset(_LADDER) | {"strip-tests"}
 _CODE_LANGUAGES = {
     "python", "notebook", "typescript", "javascript", "go", "rust",
     "java", "csharp", "php", "ruby", "kotlin", "swift", "c", "cpp", "scala",
@@ -86,12 +95,16 @@ class BlockResult:
     secret_types: list = field(default_factory=list)  # types only, never values
     mode_before: str = "full"
     mode_after: str = "full"
+    duplicate_of: str = ""     # keeper path for duplicate / near-duplicate drops
+    similarity: float | None = None  # line-shingle Jaccard for near drops
 
     def to_dict(self):
         return {"path": self.path, "action": self.action, "reason": self.reason,
                 "tokens_in": self.tokens_in, "tokens_out": self.tokens_out,
                 "secret_types": list(self.secret_types),
-                "mode_before": self.mode_before, "mode_after": self.mode_after}
+                "mode_before": self.mode_before, "mode_after": self.mode_after,
+                "duplicate_of": self.duplicate_of,
+                "similarity": self.similarity}
 
 
 @dataclass
@@ -149,6 +162,18 @@ def transform_request(request: dict, budget_tokens: int = 60_000) -> TransformRe
     """Transform an Anthropic Messages request dict. Never raises for
     shape problems: unrecognised shapes come back unchanged. Callers who
     need fail-open semantics should still wrap this (the server does)."""
+    if not isinstance(request, dict):
+        # A JSON array/string/number is a valid JSON body but not a
+        # Messages request: pass it through untouched, marked fallback,
+        # exactly as the server's own not-an-object guard does. (This
+        # previously raised AttributeError on request.get, breaking the
+        # "never raises for shape problems" promise for direct callers
+        # such as the transform CLI command.)
+        return TransformResult(
+            request=copy.deepcopy(request), transform_map=[],
+            tokens_in=0, tokens_out=0,
+            context_tokens_in=0, context_tokens_out=0,
+            fallback=True, fallback_reason="request-not-an-object")
     original_text_total = estimate_tokens(_request_text(request))
     result = TransformResult(
         request=copy.deepcopy(request), transform_map=[],
@@ -186,6 +211,8 @@ def transform_request(request: dict, budget_tokens: int = 60_000) -> TransformRe
         return result
 
     seen_hashes: dict[str, str] = {}
+    seen_normalized: dict[str, str] = {}
+    kept_fingerprints: list = []  # (path, fingerprint) of kept blocks, in order
     slicer_ok = slice_adapter.available()
     kept = []
     for b in blocks:
@@ -207,12 +234,44 @@ def transform_request(request: dict, budget_tokens: int = 60_000) -> TransformRe
             result.files_dropped.append(path)
             continue
         digest = hashlib.sha256(body.encode("utf-8", "replace")).hexdigest()
+        fingerprint = slice_adapter.duplicate_fingerprint(body)
+        norm_digest = fingerprint["normalized_digest"]
+        exact_keeper = None
         if digest in seen_hashes:
+            exact_keeper = seen_hashes[digest]
+        elif norm_digest is not None and norm_digest in seen_normalized:
+            exact_keeper = seen_normalized[norm_digest]
+        if exact_keeper is not None:
             b.update(action="dropped", reason="duplicate", new_body=None,
-                     tokens_out=0)
+                     tokens_out=0, duplicate_of=exact_keeper, similarity=1.0)
+            result.files_dropped.append(path)
+            continue
+        # Near duplicates (GhostSlice line-shingle Jaccard): only an
+        # earlier KEPT block can be the keeper -- a block dropped as
+        # junk or by the secrets guard never causes a later, clean
+        # block to be dropped as its "duplicate".
+        near_keeper, near_sim = None, 0.0
+        if fingerprint["near_eligible"]:
+            threshold = slice_adapter.near_threshold()
+            for kept_path, kept_fp in kept_fingerprints:
+                if not kept_fp["near_eligible"]:
+                    continue
+                sim = slice_adapter.near_similarity(fingerprint, kept_fp)
+                if sim > near_sim:
+                    near_keeper, near_sim = kept_path, sim
+            if near_sim < threshold:
+                near_keeper = None
+        if near_keeper is not None:
+            b.update(action="dropped", reason="near-duplicate",
+                     new_body=None, tokens_out=0,
+                     duplicate_of=near_keeper,
+                     similarity=round(near_sim, 4))
             result.files_dropped.append(path)
             continue
         seen_hashes[digest] = path
+        if norm_digest is not None:
+            seen_normalized[norm_digest] = path
+        kept_fingerprints.append((path, fingerprint))
         b.update(action="full", reason="within-budget", new_body=body,
                  tokens_out=tin)
         kept.append(b)
@@ -276,7 +335,7 @@ def transform_request(request: dict, budget_tokens: int = 60_000) -> TransformRe
 
     # Pass 3: write back.
     for b in blocks:
-        mode_after = b["action"] if b["action"] in _LADDER else (
+        mode_after = b["action"] if b["action"] in _KNOWN_MODES else (
             "exclude" if b["action"] == "dropped" else b.get("mode_before", "full"))
         header = b["header"]
         if b["new_body"] is not None and "(mode:" in header:
@@ -295,7 +354,9 @@ def transform_request(request: dict, budget_tokens: int = 60_000) -> TransformRe
             tokens_in=b["tokens_in"], tokens_out=b["tokens_out"],
             secret_types=b.get("secret_types", []),
             mode_before=b.get("mode_before", "full"),
-            mode_after=mode_after).to_dict())
+            mode_after=mode_after,
+            duplicate_of=b.get("duplicate_of", ""),
+            similarity=b.get("similarity")).to_dict())
 
     result.tokens_out = estimate_tokens(_request_text(result.request))
     return result
@@ -303,6 +364,8 @@ def transform_request(request: dict, budget_tokens: int = 60_000) -> TransformRe
 
 def _request_text(request: dict) -> str:
     """All human text in a request, for whole-request token estimates."""
+    if not isinstance(request, dict):
+        return ""
     out = []
     def walk(obj):
         if isinstance(obj, str):

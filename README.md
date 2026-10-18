@@ -83,6 +83,23 @@ PYTHONPATH=src:../ghostslice/src python3 -m ghostproxy --help
 
 Requires Python 3.10 or newer.
 
+## Commands at a glance
+
+| Command | What it does |
+|---|---|
+| `serve` | Run the localhost proxy. Options: `--host`, `--port`, `--upstream`, `--project`, `--budget`, `--ledger`, `--log-bodies` (explicit opt-in only; see Trust above). |
+| `doctor` | One-screen health check: loopback host rule, port free, profile valid, GhostSlice importable, ledger writable. No paid calls; `--check-upstream` adds a bare, unauthenticated HEAD probe. |
+| `report` | Roll the JSONL ledger into a summary (Markdown by default, `--json` for JSON, `-o FILE` to write the JSON to a file). |
+| `transform` | Transform one Anthropic Messages JSON file and print the result, with the transform map on stderr. Debug/demo tool; `--budget` sets the context budget, `-` reads stdin. |
+| `--version` | Print the version and exit. `--help` works on every subcommand. |
+
+Built-in defaults, used when neither a profile nor a flag overrides
+them: host `127.0.0.1`, port `8787`, upstream
+`https://api.anthropic.com`, per-request context budget 60,000
+estimated tokens. The examples below pass `--port 8765` explicitly,
+so what you see in the examples is the port they chose, not the
+default.
+
 ## Quickstart (fake upstream, no API key, no spend)
 
 The fastest safe look uses the bundled fake upstream, which
@@ -126,9 +143,9 @@ screen before the first request, not just in this file.
      --project ~/your-project
    ```
 
-2. Check its health (read-only; a headers-only upstream check, no
-   billable test call unless you pass `--live-check` and accept
-   the labelled cost):
+2. Check its health (read-only; no billable test call is ever
+   made. Adding `--check-upstream` also sends a bare HEAD probe to
+   the upstream: no auth header, no billable request):
 
    ```bash
    PYTHONPATH=src:../ghostslice/src python3 -m ghostproxy doctor \
@@ -183,7 +200,13 @@ In order, per request:
    signatures, then interfaces) until the context fits the
    per-request budget from your profile.
 3. **Drop duplicates** using GhostSlice's exact and near
-   duplicate detection.
+   duplicate detection: exact copies match after GhostSlice
+   normalization (trailing whitespace and trailing blank lines
+   ignored), and a block that is a near duplicate of an earlier
+   kept block (line-shingle Jaccard similarity at least 0.85,
+   above GhostSlice's 200-character and 8-line size floors) is
+   dropped as well. The transform map records the keeper's path
+   (`duplicate_of`) and, for near duplicates, the similarity.
 
 Per-request results land in a JSONL ledger (in the project, next
 to GhostSlice's history) with fields GhostBench can consume:
@@ -222,8 +245,13 @@ as everywhere else in the family. See
 ## Tests
 
 ```bash
-PYTHONPATH=src python3 -m pytest tests -q
+PYTHONPATH=src:../ghostslice/src python3 -m pytest tests -q
 ```
+
+(GhostSlice's `src` belongs on the path here, as in Install above:
+part of the suite checks the fallback secrets guard against the
+real GhostSlice guard, and those tests fail with
+`ModuleNotFoundError: ghostslice` if it is missing.)
 
 The suite runs entirely against a fake upstream on 127.0.0.1: the
 fail-open battery (malformed JSON, oversize bodies, slicer

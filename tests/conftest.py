@@ -28,6 +28,18 @@ ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
 GHOSTSLICE_SRC = Path.home() / "workspace" / "ghostslice" / "src"
 
+# Make in-process imports work regardless of the caller's PYTHONPATH
+# or of this copy's depth on disk: test modules import ``ghostproxy``
+# (src layout) directly, and the fallback-parity tests import
+# ``ghostslice`` directly. ProxyProcess below already puts exactly
+# these two paths on PYTHONPATH for the proxy subprocess; this is the
+# same bootstrap for the test process itself. (The sibling-layout
+# bootstrap in ghostproxy.tokens only resolves when the two checkouts
+# sit side by side, which copies of this tree do not guarantee.)
+for _path in (SRC, GHOSTSLICE_SRC):
+    if _path.is_dir() and str(_path) not in sys.path:
+        sys.path.insert(0, str(_path))
+
 CORE_PRESENT = (SRC / "ghostproxy").is_dir() and any(
     (SRC / "ghostproxy" / name).exists() for name in ("__main__.py", "cli.py", "server.py", "proxy.py")
 )
@@ -130,31 +142,20 @@ class _UpstreamHandler(BaseHTTPRequestHandler):
             self._send(500, b'{"type":"error","error":{"type":"api_error",'
                             b'"message":"fake upstream failure"}}')
             return
-        if mode in ("stream", "stream_length"):
-            payloads = [
-                f'data: {{"type":"content_block_delta","index":0,"delta":{{"text":"chunk-{i}"}}}}\n\n'.encode()
-                for i in range(3)
-            ]
+        if mode == "stream":
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
-            if mode == "stream":
-                self.send_header("Transfer-Encoding", "chunked")
-            else:
-                self.send_header("Content-Length", str(sum(map(len, payloads))))
+            self.send_header("Transfer-Encoding", "chunked")
             self.end_headers()
-            for i, payload in enumerate(payloads):
+            for i in range(3):
+                payload = f'data: {{"type":"content_block_delta","index":0,"delta":{{"text":"chunk-{i}"}}}}\n\n'.encode()
                 if self.server.drop_after is not None and i >= self.server.drop_after:
-                    self.close_connection = True
                     self.connection.close()
                     return
-                if mode == "stream":
-                    self.wfile.write(b"%x\r\n%s\r\n" % (len(payload), payload))
-                else:
-                    self.wfile.write(payload)
+                self.wfile.write(b"%x\r\n%s\r\n" % (len(payload), payload))
                 self.wfile.flush()
                 time.sleep(0.02)
-            if mode == "stream":
-                self.wfile.write(b"0\r\n\r\n")
+            self.wfile.write(b"0\r\n\r\n")
             return
         if mode == "mirror":
             self._send(200, body, self.headers.get("Content-Type", "application/json"))
