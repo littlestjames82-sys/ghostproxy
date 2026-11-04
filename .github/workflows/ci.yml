@@ -24,4 +24,4 @@ jobs:
       - name: Check out GhostSlice (sibling dependency)
         run: git clone --depth 1 https://github.com/littlestjames82-sys/ghostslice.git "$HOME/workspace/ghostslice"
       - name: Run tests
-        run: python -m pytest -q
+        run: python -m pytest -q tests
